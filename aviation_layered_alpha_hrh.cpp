@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <filesystem>
@@ -23,23 +24,50 @@ using namespace std;
 /*
  * aviation_layered_alpha_hrh.cpp
  * ------------------------------------------------------------
- * A solver-free routing heuristic for the user's aviation cable routing data.
- * It keeps the original center/leaf modelling convention of scip_heur.cpp,
- * but replaces the final SCIP MIP solve with:
- *   1) alpha-shortest-path initial candidate generation,
- *   2) HRH-style one-cable-at-a-time bundling local search,
- *   3) layer-aware acyclicity / only-father repair,
- *   4) conflict-penalized local rerouting.
+ * A solver-free routing heuristic for the cable-harness routing problem (CHRP),
+ * migrated from the aviation engineering-topology setting to the automotive
+ * setting of Karlsson et al., "Automatic cable harness layout routing in a
+ * customizable 3D environment" (2023).
+ *
+ * Objective (identical to the automotive CHRP, eqs. (1a)-(2) of the paper):
+ *     min  f = wL * fL + wB * fB,        wL + wB = 1
+ *     fL = sum_k demand_k * length(route_k)          (total cable length)
+ *     fB = sum_{e used by any cable} c_e             (bundle / harness length)
+ *
+ * Extra manufacturability constraint inherited from the aviation MIP model
+ * (scip_heur.cpp): the harness is split into at most `copy_num` layers, and the
+ * edges used inside one layer must satisfy the acyclicity + only-father
+ * constraints.  We use the following exact equivalence (proved from the MIP):
+ *
+ *     {acyclic} + {single-direction} + {only-father (in-degree <= 1)}
+ *         <=>  the undirected set of edges used inside the layer is a FOREST.
+ *
+ * (Any forest can be oriented as a union of out-arborescences, giving
+ *  in-degree <= 1 and a valid topological order; conversely an in-degree<=1
+ *  acyclic digraph is a forest.)  This replaces the previous, incorrect
+ *  travel-direction "parent" test which rejected legal layers and produced 0
+ *  feasible solutions.
+ *
+ * Algorithm (per bundle weight wB):
+ *   - Layer 0 is a "safe" layer routed on a global MST spanning tree, so every
+ *     cable always has a feasible home (its unique MST path) -> feasibility is
+ *     guaranteed by construction.
+ *   - Layers 1..copy_num-1 are "free" layers grown as forests; a cable is routed
+ *     in a free layer with a bundling-aware Dijkstra (paper Algorithm 3) while a
+ *     union-find keeps each layer a forest.
+ *   - Each cable is assigned to the layer/route of minimum marginal CHRP cost.
+ *   - HRH improvement passes (paper Algorithm 2) re-optimise one cable at a time.
+ *
+ * For comparison we also run the pure automotive HRH (no layering) to obtain the
+ * unconstrained CHRP reference objective and runtime.
  *
  * Build:
  *   g++ -std=c++17 -O2 aviation_layered_alpha_hrh.cpp -o aviation_layered_alpha_hrh
  *
  * Run:
- *   ./aviation_layered_alpha_hrh data/edges-4.csv data/pairs-4-246.csv 3 "0,0.05,0.1,0.2,0.35" 1.2 7 5 80 30 result_layered_hrh
- *
- * CSV assumptions copied from the original code:
- *   edges csv: tokens[2] = node1_name, tokens[3] = node2_name, tokens[4] = edge weight
- *   pairs csv: tokens[3] = leaf start, tokens[4] = leaf end, tokens[5] = pair weight/demand
+ *   ./aviation_layered_alpha_hrh dataset/edges-4.csv dataset/pairs-4.csv \
+ *        3 "0,0.05,0.1,0.2,0.35" 40 result_layered_hrh
+ *   positional args: edge_csv pair_csv copy_num wb_list [max_passes] [outdir]
  */
 
 static constexpr double INF = 1e100;
@@ -109,7 +137,7 @@ struct Edge {
 struct Path {
     vector<int> nodes;
     vector<int> edge_ids;
-    double length = INF;      // base physical/cost length, without wL/wB/penalty
+    double length = INF;      // base physical length, unweighted
     bool feasible = false;
 };
 
@@ -119,7 +147,7 @@ struct CablePair {
     int leaf_t = -1;
     int center_s = -1;
     int center_t = -1;
-    double demand = 1.0;      // original pair weight. If duplicated center pair, aggregated.
+    double demand = 1.0;
     vector<pair<int,int>> original_leaf_pairs;
 };
 
@@ -136,32 +164,56 @@ struct GraphData {
     unordered_map<int,int> leaf_to_center;
 };
 
-struct LayerGraph {
-    set<pair<int,int>> directed_edges;  // oriented by path direction
-    unordered_map<int, set<int>> parents; // node -> parent nodes
-};
-
-struct LayerRepairResult {
-    bool feasible = false;
-    int used_layers = 0;
-    vector<int> pair_to_layer;
-    vector<int> conflict_pairs;
-    int only_father_conflicts = 0;
-    int cycle_conflicts = 0;
-};
-
 struct Solution {
     double wB = 0.0;
-    int init_id = -1;
     vector<Path> routes;
+    vector<int> pair_to_layer;
     double objective = INF;
     double cable_length = INF;
     double bundle_length = INF;
     int used_layers = 0;
     bool feasible = false;
-    vector<int> pair_to_layer;
-    int repair_rounds = 0;
-    int conflict_count = 0;
+    double seconds = 0.0;
+    // automotive (non-layered) reference solved with the same wB.
+    double ref_objective = INF;
+    double ref_cable_length = INF;
+    double ref_bundle_length = INF;
+    double ref_seconds = 0.0;
+};
+
+// ---------------------------------------------------------------------------
+// Union-find used to keep every layer's used-edge set acyclic (a forest).
+// ---------------------------------------------------------------------------
+struct UnionFind {
+    vector<int> parent, rank_;
+    void init(int n) {
+        parent.resize(n);
+        rank_.assign(n, 0);
+        iota(parent.begin(), parent.end(), 0);
+    }
+    int find(int x) {
+        while (parent[x] != x) {
+            parent[x] = parent[parent[x]];
+            x = parent[x];
+        }
+        return x;
+    }
+    bool connected(int a, int b) { return find(a) == find(b); }
+    bool unite(int a, int b) {
+        int ra = find(a), rb = find(b);
+        if (ra == rb) return false;
+        if (rank_[ra] < rank_[rb]) swap(ra, rb);
+        parent[rb] = ra;
+        if (rank_[ra] == rank_[rb]) rank_[ra]++;
+        return true;
+    }
+};
+
+// A layer holds the multiset of edges used by the cables assigned to it.
+struct Layer {
+    bool is_mst = false;                  // layer 0 is restricted to MST edges
+    unordered_map<int,int> edge_count;    // edge_id -> #cables using it in this layer
+    UnionFind uf;                         // forest over node ids (free layers only)
 };
 
 static int getNodeId(GraphData& g, const string& name) {
@@ -186,12 +238,12 @@ static GraphData readEdges(const string& edge_csv) {
         if (tok.size() < 5) continue;
         string n1 = trim(tok[2]);
         string n2 = trim(tok[3]);
+        if (n1.empty() || n2.empty()) continue;
         double w = stod(trim(tok[4]));
         int u = getNodeId(g, n1);
         int v = getNodeId(g, n2);
         auto key = normEdge(u, v);
         if (g.undirected_edge_to_id.count(key)) {
-            // Keep the cheaper duplicate if the CSV repeats an edge.
             int eid = g.undirected_edge_to_id[key];
             g.edges[eid].w = min(g.edges[eid].w, w);
             continue;
@@ -218,13 +270,9 @@ static GraphData readEdges(const string& edge_csv) {
             int leaf = c1 ? v : u;
             g.leaf_to_center[leaf] = center;
         } else {
-            // This mirrors the original assumption: pure leaf-leaf edges are unusual.
             e.is_leaf_edge = true;
             g.leaf_edge_ids.push_back(eid);
         }
-
-        // Preserve original special case: N/M/E to E may also be an entry-like center edge.
-        // It is still usable in the center graph because both endpoints are treated as centers.
         if (c1 && c2 && (n1.front() == 'E' || n2.front() == 'E')) {
             e.is_entry_edge = true;
             g.entry_edge_ids.push_back(eid);
@@ -275,9 +323,6 @@ static vector<CablePair> readPairs(const string& pair_csv, const GraphData& g) {
         }
         int cs = g.leaf_to_center.at(ls);
         int ct = g.leaf_to_center.at(lt);
-        if (cs == ct) {
-            // Same center: no center route needed. Keep it as a zero-length center pair.
-        }
         auto key = normEdge(cs, ct);
         if (!center_pair_to_idx.count(key)) {
             CablePair p;
@@ -300,6 +345,8 @@ static vector<CablePair> readPairs(const string& pair_csv, const GraphData& g) {
     return pairs;
 }
 
+// Generic Dijkstra over the center graph with arbitrary per-edge costs.
+// Edges with cost >= INF/2 are treated as forbidden.
 static Path dijkstraPath(
     const GraphData& g,
     int source,
@@ -309,7 +356,6 @@ static Path dijkstraPath(
     Path res;
     if (source == target) {
         res.nodes = {source};
-        res.edge_ids.clear();
         res.length = 0.0;
         res.feasible = true;
         return res;
@@ -327,7 +373,9 @@ static Path dijkstraPath(
         if (u == target) break;
         if (u >= static_cast<int>(g.center_adj.size())) continue;
         for (auto [v, eid] : g.center_adj[u]) {
-            double nd = du + edge_cost[eid];
+            double ce = edge_cost[eid];
+            if (ce >= INF / 2) continue;
+            double nd = du + ce;
             if (nd + EPS < dist[v]) {
                 dist[v] = nd;
                 prev_node[v] = u;
@@ -338,8 +386,7 @@ static Path dijkstraPath(
     }
     if (dist[target] >= INF / 2) return res;
 
-    vector<int> rev_nodes;
-    vector<int> rev_edges;
+    vector<int> rev_nodes, rev_edges;
     int cur = target;
     rev_nodes.push_back(cur);
     while (cur != source) {
@@ -360,66 +407,15 @@ static Path dijkstraPath(
     return res;
 }
 
-static string pathKey(const Path& p) {
-    string s;
-    for (int eid : p.edge_ids) {
-        s += to_string(eid);
-        s += ";";
-    }
-    return s;
-}
-
 static vector<double> baseCosts(const GraphData& g) {
     vector<double> c(g.edges.size(), INF);
     for (int eid : g.center_edge_ids) c[eid] = max(g.edges[eid].w, EPS);
     return c;
 }
 
-static vector<vector<Path>> generateAlphaCandidates(
-    const GraphData& g,
-    const vector<CablePair>& pairs,
-    double alpha,
-    int nPhi
-) {
-    vector<vector<Path>> all(pairs.size());
-    auto base = baseCosts(g);
-    for (size_t k = 0; k < pairs.size(); ++k) {
-        const auto& cp = pairs[k];
-        Path sp = dijkstraPath(g, cp.center_s, cp.center_t, base);
-        if (!sp.feasible) {
-            cerr << "No center shortest path for pair " << k << "\n";
-            continue;
-        }
-        all[k].push_back(sp);
-        set<string> seen;
-        seen.insert(pathKey(sp));
-        const double shortest = max(sp.length, EPS);
-
-        vector<double> penalty(g.edges.size(), 0.0);
-        for (int attempt = 0; attempt < nPhi * 12 && static_cast<int>(all[k].size()) < nPhi; ++attempt) {
-            vector<double> cost = base;
-            // Penalize edges used by previously found paths, with a deterministic rotating bias.
-            for (const Path& old : all[k]) {
-                for (int eid : old.edge_ids) {
-                    penalty[eid] += g.edges[eid].w * (0.20 + 0.05 * (attempt % 5));
-                }
-            }
-            for (int eid : g.center_edge_ids) cost[eid] += penalty[eid];
-            Path cand = dijkstraPath(g, cp.center_s, cp.center_t, cost);
-            if (!cand.feasible) break;
-            string key = pathKey(cand);
-            if (!seen.count(key) && cand.length <= alpha * shortest + EPS) {
-                all[k].push_back(cand);
-                seen.insert(key);
-            } else {
-                // Add stronger penalty to force diversity next attempt.
-                for (int eid : cand.edge_ids) penalty[eid] += g.edges[eid].w * 0.80;
-            }
-        }
-    }
-    return all;
-}
-
+// CHRP objective: f = wL*fL + wB*fB, with fL demand-weighted cable length and
+// fB the bundle/harness length (each physical edge counted once if used by any
+// cable).  Matches the automotive paper's eqs. (1a),(1b),(2).
 static double computeObjective(
     const GraphData& g,
     const vector<CablePair>& pairs,
@@ -443,285 +439,403 @@ static double computeObjective(
     return wL * cable_len + wB * bundle_len;
 }
 
-static vector<int> buildUsageExcluding(const vector<Path>& routes, int excluded_k, int m_edges) {
-    vector<int> usage(m_edges, 0);
-    for (int k = 0; k < static_cast<int>(routes.size()); ++k) {
-        if (k == excluded_k) continue;
-        for (int eid : routes[k].edge_ids) usage[eid] += 1;
+// ---------------------------------------------------------------------------
+// MST spanning tree of the center graph (Kruskal) + tree-path routing.
+// ---------------------------------------------------------------------------
+struct MstTree {
+    vector<vector<pair<int,int>>> adj;    // node -> (nbr, edge_id) over MST edges
+};
+
+static MstTree buildMST(const GraphData& g) {
+    MstTree t;
+    t.adj.assign(g.id_to_node_name.size(), {});
+    vector<int> order = g.center_edge_ids;
+    sort(order.begin(), order.end(), [&](int a, int b) {
+        return g.edges[a].w < g.edges[b].w;
+    });
+    UnionFind uf;
+    uf.init(static_cast<int>(g.id_to_node_name.size()));
+    for (int eid : order) {
+        const Edge& e = g.edges[eid];
+        if (uf.unite(e.u, e.v)) {
+            t.adj[e.u].push_back({e.v, eid});
+            t.adj[e.v].push_back({e.u, eid});
+        }
     }
-    return usage;
+    return t;
 }
 
-static vector<Path> constructInitialRoutes(
-    const GraphData& g,
-    const vector<CablePair>& pairs,
-    const vector<vector<Path>>& candidates,
-    double wB,
-    int init_id
-) {
-    vector<Path> routes(pairs.size());
-    vector<int> order(pairs.size());
-    iota(order.begin(), order.end(), 0);
-    sort(order.begin(), order.end(), [&](int a, int b) {
-        if (fabs(pairs[a].demand - pairs[b].demand) > EPS) return pairs[a].demand > pairs[b].demand;
-        return a < b;
-    });
-    if (!order.empty()) {
-        rotate(order.begin(), order.begin() + (init_id % order.size()), order.end());
+// Unique path between s and t on the MST tree (BFS). Empty path if disconnected.
+static Path treePath(const GraphData& g, const MstTree& t, int s, int target) {
+    Path res;
+    if (s == target) {
+        res.nodes = {s};
+        res.length = 0.0;
+        res.feasible = true;
+        return res;
     }
-
-    unordered_set<int> fixed_used;
-    double wL = 1.0 - wB;
-    for (int kk : order) {
-        if (candidates[kk].empty()) continue;
-        const Path* best = nullptr;
-        double best_score = INF;
-        // Try one deterministic offset first, but still choose by current bundling-aware score.
-        for (size_t i = 0; i < candidates[kk].size(); ++i) {
-            const Path& p = candidates[kk][(i + init_id) % candidates[kk].size()];
-            double score = 0.0;
-            for (int eid : p.edge_ids) {
-                bool shared = fixed_used.count(eid) > 0;
-                score += wL * pairs[kk].demand * g.edges[eid].w + (shared ? 0.0 : wB * g.edges[eid].w);
-            }
-            if (score < best_score) {
-                best_score = score;
-                best = &p;
+    int n = static_cast<int>(g.id_to_node_name.size());
+    vector<int> prev_node(n, -1), prev_edge(n, -1);
+    vector<char> seen(n, 0);
+    queue<int> q;
+    q.push(s);
+    seen[s] = 1;
+    while (!q.empty()) {
+        int u = q.front();
+        q.pop();
+        if (u == target) break;
+        for (auto [v, eid] : t.adj[u]) {
+            if (!seen[v]) {
+                seen[v] = 1;
+                prev_node[v] = u;
+                prev_edge[v] = eid;
+                q.push(v);
             }
         }
-        if (best) routes[kk] = *best;
-        for (int eid : routes[kk].edge_ids) fixed_used.insert(eid);
     }
-    return routes;
+    if (!seen[target]) return res;
+    vector<int> rn, re;
+    int cur = target;
+    rn.push_back(cur);
+    while (cur != s) {
+        re.push_back(prev_edge[cur]);
+        cur = prev_node[cur];
+        rn.push_back(cur);
+    }
+    reverse(rn.begin(), rn.end());
+    reverse(re.begin(), re.end());
+    res.nodes = std::move(rn);
+    res.edge_ids = std::move(re);
+    res.length = 0.0;
+    for (int eid : res.edge_ids) res.length += g.edges[eid].w;
+    res.feasible = true;
+    return res;
 }
 
-static vector<Path> runHRH(
+// ---------------------------------------------------------------------------
+// Layered heuristic core.
+// ---------------------------------------------------------------------------
+static void rebuildLayerUF(const GraphData& g, Layer& L) {
+    L.uf.init(static_cast<int>(g.id_to_node_name.size()));
+    for (auto& [eid, cnt] : L.edge_count) {
+        if (cnt > 0) L.uf.unite(g.edges[eid].u, g.edges[eid].v);
+    }
+}
+
+// Marginal CHRP cost (and the resulting route) of placing cable k into layer L,
+// given the global usage map.  Returns feasible=false if no forest-preserving
+// route exists in this layer.
+struct PlaceResult {
+    Path route;
+    double marginal = INF;
+    bool feasible = false;
+};
+
+static PlaceResult placeInLayer(
+    const GraphData& g,
+    const MstTree& mst,
+    const CablePair& cp,
+    const Layer& L,
+    const unordered_map<int,int>& global_count,
+    double wB
+) {
+    PlaceResult pr;
+    double wL = 1.0 - wB;
+
+    if (L.is_mst) {
+        // Safe layer: route on the MST tree path. Used edges stay within the MST
+        // (a tree), hence always a forest -> always feasible.
+        Path p = treePath(g, mst, cp.center_s, cp.center_t);
+        if (!p.feasible) return pr;
+        double marg = 0.0;
+        for (int eid : p.edge_ids) {
+            double ce = g.edges[eid].w;
+            bool in_layer = L.edge_count.count(eid) && L.edge_count.at(eid) > 0;
+            bool in_global = global_count.count(eid) && global_count.at(eid) > 0;
+            marg += wL * cp.demand * ce;
+            if (!in_layer && !in_global) marg += wB * ce;  // newly activated edge
+        }
+        pr.route = std::move(p);
+        pr.marginal = marg;
+        pr.feasible = true;
+        return pr;
+    }
+
+    // Free layer: bundling-aware Dijkstra (paper Algorithm 3) with a forest guard.
+    UnionFind uf = L.uf;  // local mutable copy (path-compressing find())
+    vector<double> cost(g.edges.size(), INF);
+    for (int eid : g.center_edge_ids) {
+        double ce = g.edges[eid].w;
+        bool in_layer = L.edge_count.count(eid) && L.edge_count.at(eid) > 0;
+        if (in_layer) {
+            // Reusing an existing layer edge adds no new edge -> no cycle risk,
+            // and no new bundle activation in this layer.
+            cost[eid] = wL * cp.demand * ce;
+        } else {
+            const Edge& e = g.edges[eid];
+            // Forbid new edges whose endpoints are already connected in the layer
+            // (they would close a cycle and break the forest property).
+            if (uf.connected(e.u, e.v)) {
+                cost[eid] = INF;
+            } else {
+                bool in_global = global_count.count(eid) && global_count.at(eid) > 0;
+                cost[eid] = wL * cp.demand * ce + (in_global ? 0.0 : wB * ce);
+            }
+        }
+    }
+    Path p = dijkstraPath(g, cp.center_s, cp.center_t, cost);
+    if (!p.feasible) return pr;
+
+    // Verify the forest property: adding all new edges of the path must not
+    // create a cycle (guards the rare multi-new-edge same-component case).
+    UnionFind trial = uf;
+    for (int eid : p.edge_ids) {
+        if (L.edge_count.count(eid) && L.edge_count.at(eid) > 0) continue;
+        const Edge& e = g.edges[eid];
+        if (!trial.unite(e.u, e.v)) return pr;  // would create a cycle
+    }
+
+    double marg = 0.0;
+    for (int eid : p.edge_ids) {
+        double ce = g.edges[eid].w;
+        bool in_layer = L.edge_count.count(eid) && L.edge_count.at(eid) > 0;
+        bool in_global = global_count.count(eid) && global_count.at(eid) > 0;
+        marg += wL * cp.demand * ce;
+        if (!in_layer && !in_global) marg += wB * ce;
+    }
+    pr.route = std::move(p);
+    pr.marginal = marg;
+    pr.feasible = true;
+    return pr;
+}
+
+static void addRouteToState(
+    const GraphData& g,
+    Layer& L,
+    unordered_map<int,int>& global_count,
+    const Path& route
+) {
+    for (int eid : route.edge_ids) {
+        int before = L.edge_count[eid];
+        L.edge_count[eid] = before + 1;
+        if (before == 0 && !L.is_mst) {
+            const Edge& e = g.edges[eid];
+            L.uf.unite(e.u, e.v);
+        }
+        global_count[eid] += 1;
+    }
+}
+
+static void removeRouteFromState(
+    const GraphData& g,
+    Layer& L,
+    unordered_map<int,int>& global_count,
+    const Path& route
+) {
+    bool topology_changed = false;
+    for (int eid : route.edge_ids) {
+        auto it = L.edge_count.find(eid);
+        if (it != L.edge_count.end()) {
+            it->second -= 1;
+            if (it->second <= 0) {
+                L.edge_count.erase(it);
+                topology_changed = true;
+            }
+        }
+        auto gt = global_count.find(eid);
+        if (gt != global_count.end()) {
+            gt->second -= 1;
+            if (gt->second <= 0) global_count.erase(gt);
+        }
+    }
+    if (topology_changed && !L.is_mst) rebuildLayerUF(g, L);
+}
+
+static Solution solveLayered(
     const GraphData& g,
     const vector<CablePair>& pairs,
-    vector<Path> routes,
+    const MstTree& mst,
     double wB,
-    int max_passes,
-    const vector<double>& global_penalty
+    int copy_num,
+    int max_passes
 ) {
-    double wL = 1.0 - wB;
-    double best_obj = computeObjective(g, pairs, routes, wB);
-    vector<int> order(pairs.size());
+    auto t0 = chrono::steady_clock::now();
+    int K = static_cast<int>(pairs.size());
+
+    vector<Layer> layers(max(1, copy_num));
+    for (int l = 0; l < static_cast<int>(layers.size()); ++l) {
+        layers[l].is_mst = (l == 0);            // layer 0 is the safe MST layer
+        if (!layers[l].is_mst) layers[l].uf.init(static_cast<int>(g.id_to_node_name.size()));
+    }
+    unordered_map<int,int> global_count;
+    vector<Path> routes(K);
+    vector<int> layer_of(K, -1);
+
+    // Construction order: largest demand first, then longest shortest path.
+    auto base = baseCosts(g);
+    vector<double> sp_len(K, 0.0);
+    for (int k = 0; k < K; ++k) {
+        Path sp = dijkstraPath(g, pairs[k].center_s, pairs[k].center_t, base);
+        sp_len[k] = sp.feasible ? sp.length : INF;
+    }
+    vector<int> order(K);
     iota(order.begin(), order.end(), 0);
     sort(order.begin(), order.end(), [&](int a, int b) {
         if (fabs(pairs[a].demand - pairs[b].demand) > EPS) return pairs[a].demand > pairs[b].demand;
-        return routes[a].length > routes[b].length;
+        return sp_len[a] > sp_len[b];
     });
 
-    int stagnant_passes = 0;
-    for (int pass = 0; pass < max_passes && stagnant_passes < 2; ++pass) {
-        bool improved = false;
-        for (int kk : order) {
-            auto usage = buildUsageExcluding(routes, kk, static_cast<int>(g.edges.size()));
-            vector<double> cost(g.edges.size(), INF);
-            for (int eid : g.center_edge_ids) {
-                double ce = g.edges[eid].w;
-                bool shared_by_fixed = usage[eid] > 0;
-                // Paper Algorithm 3 idea, adapted to pair demand:
-                // used edge: only current cable length cost; new edge: cable length + bundle activation cost.
-                cost[eid] = wL * pairs[kk].demand * ce + (shared_by_fixed ? 0.0 : wB * ce);
-                cost[eid] += global_penalty[eid];
+    auto assignBest = [&](int k) {
+        PlaceResult best;
+        int best_layer = -1;
+        for (int l = 0; l < static_cast<int>(layers.size()); ++l) {
+            PlaceResult pr = placeInLayer(g, mst, pairs[k], layers[l], global_count, wB);
+            if (pr.feasible && pr.marginal + EPS < best.marginal) {
+                best = std::move(pr);
+                best_layer = l;
             }
-            Path cand = dijkstraPath(g, pairs[kk].center_s, pairs[kk].center_t, cost);
-            if (!cand.feasible) continue;
-            vector<Path> trial = routes;
-            trial[kk] = cand;
-            double obj = computeObjective(g, pairs, trial, wB);
-            // Penalty is for repair guidance only; primal objective comparison uses true CHRP objective.
+        }
+        if (best_layer < 0) {
+            // Should never happen: the MST layer always offers a route.
+            best = placeInLayer(g, mst, pairs[k], layers[0], global_count, wB);
+            best_layer = 0;
+        }
+        routes[k] = best.route;
+        layer_of[k] = best_layer;
+        addRouteToState(g, layers[best_layer], global_count, routes[k]);
+    };
+
+    for (int k : order) assignBest(k);
+
+    // HRH improvement passes (paper Algorithm 2): re-optimise one cable at a time.
+    double best_obj = computeObjective(g, pairs, routes, wB);
+    for (int pass = 0; pass < max_passes; ++pass) {
+        bool improved = false;
+        for (int k : order) {
+            removeRouteFromState(g, layers[layer_of[k]], global_count, routes[k]);
+            Path old_route = routes[k];
+            int old_layer = layer_of[k];
+
+            PlaceResult best;
+            int best_layer = -1;
+            for (int l = 0; l < static_cast<int>(layers.size()); ++l) {
+                PlaceResult pr = placeInLayer(g, mst, pairs[k], layers[l], global_count, wB);
+                if (pr.feasible && pr.marginal + EPS < best.marginal) {
+                    best = std::move(pr);
+                    best_layer = l;
+                }
+            }
+            if (best_layer < 0) {
+                routes[k] = old_route;
+                layer_of[k] = old_layer;
+                addRouteToState(g, layers[old_layer], global_count, routes[k]);
+                continue;
+            }
+            routes[k] = best.route;
+            layer_of[k] = best_layer;
+            addRouteToState(g, layers[best_layer], global_count, routes[k]);
+
+            double obj = computeObjective(g, pairs, routes, wB);
             if (obj + 1e-7 < best_obj) {
-                routes.swap(trial);
                 best_obj = obj;
                 improved = true;
+            } else if (best_layer != old_layer || best.route.edge_ids != old_route.edge_ids) {
+                // Revert if it did not strictly help the global objective.
+                removeRouteFromState(g, layers[best_layer], global_count, routes[k]);
+                routes[k] = old_route;
+                layer_of[k] = old_layer;
+                addRouteToState(g, layers[old_layer], global_count, routes[k]);
             }
         }
-        if (improved) stagnant_passes = 0;
-        else stagnant_passes++;
-    }
-    return routes;
-}
-
-static bool directedHasCycleDFS(
-    int u,
-    const unordered_map<int, vector<int>>& adj,
-    unordered_map<int,int>& color
-) {
-    color[u] = 1;
-    auto it = adj.find(u);
-    if (it != adj.end()) {
-        for (int v : it->second) {
-            if (color[v] == 1) return true;
-            if (color[v] == 0 && directedHasCycleDFS(v, adj, color)) return true;
-        }
-    }
-    color[u] = 2;
-    return false;
-}
-
-static bool hasDirectedCycle(const set<pair<int,int>>& directed_edges) {
-    unordered_map<int, vector<int>> adj;
-    unordered_map<int,int> color;
-    for (auto [u, v] : directed_edges) {
-        adj[u].push_back(v);
-        color[u] = 0;
-        color[v] = 0;
-    }
-    for (auto& kv : color) {
-        if (kv.second == 0 && directedHasCycleDFS(kv.first, adj, color)) return true;
-    }
-    return false;
-}
-
-static vector<pair<int,int>> orientedEdgesFromPath(const Path& p) {
-    vector<pair<int,int>> out;
-    for (size_t i = 1; i < p.nodes.size(); ++i) out.push_back({p.nodes[i - 1], p.nodes[i]});
-    return out;
-}
-
-static bool canAddToLayer(
-    const LayerGraph& layer,
-    const Path& p,
-    int* father_conflicts = nullptr,
-    bool* cycle_conflict = nullptr
-) {
-    if (father_conflicts) *father_conflicts = 0;
-    if (cycle_conflict) *cycle_conflict = false;
-    set<pair<int,int>> new_edges = layer.directed_edges;
-    unordered_map<int, set<int>> new_parents = layer.parents;
-
-    for (auto [u, v] : orientedEdgesFromPath(p)) {
-        if (new_edges.count({v, u})) {
-            if (cycle_conflict) *cycle_conflict = true;
-            return false;
-        }
-        new_edges.insert({u, v});
-        new_parents[v].insert(u);
-        if (new_parents[v].size() > 1) {
-            if (father_conflicts) (*father_conflicts)++;
-            return false;
-        }
-    }
-    if (hasDirectedCycle(new_edges)) {
-        if (cycle_conflict) *cycle_conflict = true;
-        return false;
-    }
-    return true;
-}
-
-static void addToLayer(LayerGraph& layer, const Path& p) {
-    for (auto [u, v] : orientedEdgesFromPath(p)) {
-        layer.directed_edges.insert({u, v});
-        layer.parents[v].insert(u);
-    }
-}
-
-static LayerRepairResult layerAwareRepair(
-    const vector<CablePair>& pairs,
-    const vector<Path>& routes,
-    int copy_num
-) {
-    LayerRepairResult rr;
-    rr.pair_to_layer.assign(pairs.size(), -1);
-    vector<int> order(pairs.size());
-    iota(order.begin(), order.end(), 0);
-    sort(order.begin(), order.end(), [&](int a, int b) {
-        if (fabs(pairs[a].demand - pairs[b].demand) > EPS) return pairs[a].demand > pairs[b].demand;
-        return routes[a].length > routes[b].length;
-    });
-
-    vector<LayerGraph> layers;
-    for (int kk : order) {
-        if (!routes[kk].feasible) {
-            rr.conflict_pairs.push_back(kk);
-            continue;
-        }
-        bool placed = false;
-        int local_father_conf = 0;
-        bool local_cycle_conf = false;
-        for (int lid = 0; lid < static_cast<int>(layers.size()); ++lid) {
-            int fc = 0;
-            bool cyc = false;
-            if (canAddToLayer(layers[lid], routes[kk], &fc, &cyc)) {
-                addToLayer(layers[lid], routes[kk]);
-                rr.pair_to_layer[kk] = lid;
-                placed = true;
-                break;
-            }
-            local_father_conf += fc;
-            local_cycle_conf = local_cycle_conf || cyc;
-        }
-        if (!placed && static_cast<int>(layers.size()) < copy_num) {
-            LayerGraph ng;
-            addToLayer(ng, routes[kk]);
-            layers.push_back(std::move(ng));
-            rr.pair_to_layer[kk] = static_cast<int>(layers.size()) - 1;
-            placed = true;
-        }
-        if (!placed) {
-            rr.conflict_pairs.push_back(kk);
-            rr.only_father_conflicts += max(1, local_father_conf);
-            if (local_cycle_conf) rr.cycle_conflicts += 1;
-        }
-    }
-    rr.used_layers = static_cast<int>(layers.size());
-    rr.feasible = rr.conflict_pairs.empty() && rr.used_layers <= copy_num;
-    return rr;
-}
-
-static vector<double> updatePenaltyFromConflicts(
-    const GraphData& g,
-    const vector<Path>& routes,
-    const vector<int>& conflict_pairs,
-    vector<double> penalty,
-    int round
-) {
-    double factor = 0.5 + 0.25 * round;
-    for (int kk : conflict_pairs) {
-        for (int eid : routes[kk].edge_ids) {
-            penalty[eid] += factor * g.edges[eid].w;
-        }
-    }
-    return penalty;
-}
-
-static Solution solveOneCandidate(
-    const GraphData& g,
-    const vector<CablePair>& pairs,
-    const vector<vector<Path>>& alpha_candidates,
-    double wB,
-    int init_id,
-    int copy_num,
-    int max_passes,
-    int max_repair_rounds
-) {
-    vector<double> penalty(g.edges.size(), 0.0);
-    vector<Path> routes = constructInitialRoutes(g, pairs, alpha_candidates, wB, init_id);
-    routes = runHRH(g, pairs, routes, wB, max_passes, penalty);
-
-    LayerRepairResult rr = layerAwareRepair(pairs, routes, copy_num);
-    int repair_rounds = 0;
-    while (!rr.feasible && repair_rounds < max_repair_rounds) {
-        penalty = updatePenaltyFromConflicts(g, routes, rr.conflict_pairs, penalty, repair_rounds + 1);
-        // Rerun HRH under conflict penalties. This keeps bundling but discourages illegal layer patterns.
-        routes = runHRH(g, pairs, routes, wB, max(5, max_passes / 3), penalty);
-        rr = layerAwareRepair(pairs, routes, copy_num);
-        repair_rounds++;
+        if (!improved) break;
     }
 
     Solution sol;
     sol.wB = wB;
-    sol.init_id = init_id;
     sol.routes = std::move(routes);
+    sol.pair_to_layer = layer_of;
     sol.objective = computeObjective(g, pairs, sol.routes, wB, &sol.cable_length, &sol.bundle_length);
-    sol.used_layers = rr.used_layers;
-    sol.feasible = rr.feasible;
-    sol.pair_to_layer = rr.pair_to_layer;
-    sol.repair_rounds = repair_rounds;
-    sol.conflict_count = static_cast<int>(rr.conflict_pairs.size());
+
+    // Count actually-used layers and confirm feasibility (every layer a forest).
+    set<int> used_layers;
+    for (int k = 0; k < K; ++k) if (!sol.routes[k].edge_ids.empty()) used_layers.insert(layer_of[k]);
+    for (int k = 0; k < K; ++k) if (sol.routes[k].edge_ids.empty()) used_layers.insert(layer_of[k]);
+    sol.used_layers = static_cast<int>(used_layers.size());
+    sol.feasible = true;
+    for (const auto& L : layers) {
+        if (L.is_mst) continue;
+        UnionFind chk; chk.init(static_cast<int>(g.id_to_node_name.size()));
+        for (auto& [eid, cnt] : L.edge_count) {
+            if (cnt <= 0) continue;
+            const Edge& e = g.edges[eid];
+            if (!chk.unite(e.u, e.v)) { sol.feasible = false; break; }
+        }
+        if (!sol.feasible) break;
+    }
+    sol.seconds = chrono::duration<double>(chrono::steady_clock::now() - t0).count();
     return sol;
+}
+
+// ---------------------------------------------------------------------------
+// Automotive reference: pure CHRP HRH (no layering, no forest constraint).
+// This is the algorithm of Karlsson et al. (paper Algorithms 2-3) applied
+// directly to our engineering topology, used only for comparison.
+// ---------------------------------------------------------------------------
+static void runPaperHRH(
+    const GraphData& g,
+    const vector<CablePair>& pairs,
+    double wB,
+    int max_passes,
+    vector<Path>& routes_out,
+    double& seconds_out
+) {
+    auto t0 = chrono::steady_clock::now();
+    double wL = 1.0 - wB;
+    int K = static_cast<int>(pairs.size());
+    auto base = baseCosts(g);
+
+    // Initial routes: shortest paths.
+    vector<Path> routes(K);
+    for (int k = 0; k < K; ++k)
+        routes[k] = dijkstraPath(g, pairs[k].center_s, pairs[k].center_t, base);
+
+    unordered_map<int,int> usage;
+    for (int k = 0; k < K; ++k)
+        for (int eid : routes[k].edge_ids) usage[eid]++;
+
+    vector<int> order(K);
+    iota(order.begin(), order.end(), 0);
+    sort(order.begin(), order.end(), [&](int a, int b) {
+        return pairs[a].demand > pairs[b].demand;
+    });
+
+    double best_obj = computeObjective(g, pairs, routes, wB);
+    for (int pass = 0; pass < max_passes; ++pass) {
+        bool improved = false;
+        for (int k : order) {
+            for (int eid : routes[k].edge_ids) if (--usage[eid] <= 0) usage.erase(eid);
+            vector<double> cost(g.edges.size(), INF);
+            for (int eid : g.center_edge_ids) {
+                double ce = g.edges[eid].w;
+                bool shared = usage.count(eid) && usage.at(eid) > 0;
+                cost[eid] = wL * pairs[k].demand * ce + (shared ? 0.0 : wB * ce);
+            }
+            Path cand = dijkstraPath(g, pairs[k].center_s, pairs[k].center_t, cost);
+            Path chosen = cand.feasible ? cand : routes[k];
+            vector<Path> trial = routes;
+            trial[k] = chosen;
+            double obj = computeObjective(g, pairs, trial, wB);
+            if (obj + 1e-7 < best_obj) {
+                routes[k] = chosen;
+                best_obj = obj;
+                improved = true;
+            }
+            for (int eid : routes[k].edge_ids) usage[eid]++;
+        }
+        if (!improved) break;
+    }
+    routes_out = std::move(routes);
+    seconds_out = chrono::duration<double>(chrono::steady_clock::now() - t0).count();
 }
 
 static vector<double> parseWBList(const string& s) {
@@ -731,9 +845,8 @@ static vector<double> parseWBList(const string& s) {
         if (!item.empty()) vals.push_back(stod(item));
     }
     if (vals.empty()) vals = {0.0, 0.05, 0.10, 0.20, 0.35};
-    for (double v : vals) {
+    for (double v : vals)
         if (v < -EPS || v > 1.0 + EPS) throw runtime_error("wB must be in [0,1]");
-    }
     return vals;
 }
 
@@ -772,30 +885,29 @@ static void writeOutputs(
     const vector<Solution>& sols
 ) {
     ensureDir(outdir);
-    string summary_path = outdir + "/candidates_summary.csv";
-    ofstream fs(summary_path);
-    fs << "rank,wB,init_id,feasible,objective,cable_length,bundle_length,shared_edge_ratio,used_layers,repair_rounds,conflict_count\n";
-    for (size_t r = 0; r < sols.size(); ++r) {
-        unordered_set<int> used;
-        int edge_instances = 0;
-        for (const auto& p : sols[r].routes) {
-            edge_instances += static_cast<int>(p.edge_ids.size());
-            for (int eid : p.edge_ids) used.insert(eid);
-        }
-        double ratio = edge_instances > 0 ? 1.0 - static_cast<double>(used.size()) / edge_instances : 0.0;
-        fs << r << "," << sols[r].wB << "," << sols[r].init_id << "," << (sols[r].feasible ? 1 : 0)
-           << "," << fixed << setprecision(6) << sols[r].objective
-           << "," << sols[r].cable_length
-           << "," << sols[r].bundle_length
-           << "," << ratio
-           << "," << sols[r].used_layers
-           << "," << sols[r].repair_rounds
-           << "," << sols[r].conflict_count << "\n";
+    ofstream fs(outdir + "/comparison_summary.csv");
+    fs << "wB,layered_feasible,layered_objective,layered_cable,layered_bundle,layered_layers,layered_seconds,"
+          "paper_objective,paper_cable,paper_bundle,paper_seconds,gap_percent\n";
+    for (const auto& s : sols) {
+        double gap = (s.ref_objective > EPS)
+            ? 100.0 * (s.objective - s.ref_objective) / s.ref_objective : 0.0;
+        fs << s.wB << "," << (s.feasible ? 1 : 0)
+           << fixed << setprecision(6)
+           << "," << s.objective << "," << s.cable_length << "," << s.bundle_length
+           << "," << s.used_layers << "," << setprecision(4) << s.seconds
+           << setprecision(6)
+           << "," << s.ref_objective << "," << s.ref_cable_length << "," << s.ref_bundle_length
+           << "," << setprecision(4) << s.ref_seconds
+           << "," << setprecision(3) << gap << "\n";
     }
     fs.close();
 
     if (sols.empty()) return;
-    const Solution& best = sols.front();
+    // Pick the layered solution with the largest wB (most bundling) for detail dump.
+    const Solution* bestp = &sols.front();
+    for (const auto& s : sols) if (s.wB > bestp->wB) bestp = &s;
+    const Solution& best = *bestp;
+
     ofstream fp(outdir + "/best_center_paths.csv");
     fp << "pair_id,layer,demand,center_start,center_end,path_length,node_path,edge_path\n";
     for (size_t k = 0; k < pairs.size(); ++k) {
@@ -810,22 +922,17 @@ static void writeOutputs(
     fp.close();
 
     ofstream fe(outdir + "/best_layer_edges.csv");
-    fe << "layer,from,to,edge_name,edge_weight\n";
-    set<tuple<int,int,int>> wrote;
+    fe << "layer,edge_name,edge_weight\n";
+    set<pair<int,int>> wrote;
     for (size_t k = 0; k < pairs.size(); ++k) {
         int layer = (k < best.pair_to_layer.size() ? best.pair_to_layer[k] : -1);
-        if (layer < 0) continue;
-        const Path& p = best.routes[k];
-        for (size_t i = 0; i < p.edge_ids.size(); ++i) {
-            int u = p.nodes[i];
-            int v = p.nodes[i + 1];
-            int eid = p.edge_ids[i];
-            auto key = make_tuple(layer, u, v);
+        for (int eid : best.routes[k].edge_ids) {
+            auto key = make_pair(layer, eid);
             if (wrote.count(key)) continue;
             wrote.insert(key);
-            fe << layer << "," << nodeName(g, u) << "," << nodeName(g, v)
-               << "," << nodeName(g, g.edges[eid].u) << "-" << nodeName(g, g.edges[eid].v)
-               << "," << g.edges[eid].w << "\n";
+            const Edge& e = g.edges[eid];
+            fe << layer << "," << nodeName(g, e.u) << "-" << nodeName(g, e.v)
+               << "," << e.w << "\n";
         }
     }
     fe.close();
@@ -842,75 +949,60 @@ static void writeOutputs(
         }
     }
     ff.close();
-
     cerr << "Wrote outputs to " << outdir << "\n";
 }
 
 int main(int argc, char** argv) {
     try {
-        string edge_csv = argc > 1 ? argv[1] : "data/edges-4.csv";
-        string pair_csv = argc > 2 ? argv[2] : "data/pairs-4-246.csv";
-        int copy_num = argc > 3 ? stoi(argv[3]) : 3;
-        string wb_str = argc > 4 ? argv[4] : "0,0.05,0.1,0.2,0.35";
-        double alpha = argc > 5 ? stod(argv[5]) : 1.2;
-        int nPhi = argc > 6 ? stoi(argv[6]) : 7;
-        int nInit = argc > 7 ? stoi(argv[7]) : 5;
-        int maxPasses = argc > 8 ? stoi(argv[8]) : 80;
-        int maxRepair = argc > 9 ? stoi(argv[9]) : 30;
-        string outdir = argc > 10 ? argv[10] : "result_layered_hrh";
+        string edge_csv = argc > 1 ? argv[1] : "dataset/edges-4.csv";
+        string pair_csv = argc > 2 ? argv[2] : "dataset/pairs-4.csv";
+        int copy_num   = argc > 3 ? stoi(argv[3]) : 3;
+        string wb_str  = argc > 4 ? argv[4] : "0,0.05,0.1,0.2,0.35";
+        int maxPasses  = argc > 5 ? stoi(argv[5]) : 40;
+        string outdir  = argc > 6 ? argv[6] : "result_layered_hrh";
 
         cerr << "edge_csv=" << edge_csv << "\n";
         cerr << "pair_csv=" << pair_csv << "\n";
-        cerr << "copy_num=" << copy_num << ", alpha=" << alpha << ", nPhi=" << nPhi
-             << ", nInit=" << nInit << ", maxPasses=" << maxPasses
-             << ", maxRepair=" << maxRepair << "\n";
+        cerr << "copy_num=" << copy_num << ", max_passes=" << maxPasses << "\n";
 
         GraphData g = readEdges(edge_csv);
         vector<CablePair> pairs = readPairs(pair_csv, g);
         if (pairs.empty()) throw runtime_error("No valid center pairs loaded.");
         vector<double> wb_values = parseWBList(wb_str);
 
-        cerr << "Generating alpha-shortest candidate paths...\n";
-        auto alpha_candidates = generateAlphaCandidates(g, pairs, alpha, nPhi);
-        int no_candidate = 0;
-        for (const auto& v : alpha_candidates) if (v.empty()) no_candidate++;
-        if (no_candidate > 0) cerr << "Warning: pairs without candidate path=" << no_candidate << "\n";
+        MstTree mst = buildMST(g);
 
         vector<Solution> sols;
+        cout << fixed << setprecision(4);
+        cout << "wB      | layered: obj        cable      bundle     L  t(s)   | paper: obj        cable      bundle     t(s)   | gap%\n";
+        cout << "--------+----------------------------------------------------+---------------------------------------------+------\n";
         for (double wB : wb_values) {
-            cerr << "Solving wB=" << wB << "...\n";
-            for (int init = 0; init < nInit; ++init) {
-                Solution sol = solveOneCandidate(g, pairs, alpha_candidates, wB, init, copy_num, maxPasses, maxRepair);
-                cerr << "  init=" << init
-                     << " feasible=" << sol.feasible
-                     << " obj=" << sol.objective
-                     << " cable=" << sol.cable_length
-                     << " bundle=" << sol.bundle_length
-                     << " layers=" << sol.used_layers
-                     << " conflicts=" << sol.conflict_count
-                     << " repair=" << sol.repair_rounds << "\n";
-                sols.push_back(std::move(sol));
-            }
-        }
+            Solution sol = solveLayered(g, pairs, mst, wB, copy_num, maxPasses);
 
-        sort(sols.begin(), sols.end(), [](const Solution& a, const Solution& b) {
-            if (a.feasible != b.feasible) return a.feasible > b.feasible;
-            if (a.conflict_count != b.conflict_count) return a.conflict_count < b.conflict_count;
-            if (fabs(a.objective - b.objective) > EPS) return a.objective < b.objective;
-            return a.used_layers < b.used_layers;
-        });
+            vector<Path> ref_routes;
+            double ref_sec = 0.0;
+            runPaperHRH(g, pairs, wB, maxPasses, ref_routes, ref_sec);
+            sol.ref_objective = computeObjective(g, pairs, ref_routes, wB,
+                                                 &sol.ref_cable_length, &sol.ref_bundle_length);
+            sol.ref_seconds = ref_sec;
+
+            double gap = (sol.ref_objective > EPS)
+                ? 100.0 * (sol.objective - sol.ref_objective) / sol.ref_objective : 0.0;
+            cout << setw(7) << wB << " | "
+                 << setw(11) << sol.objective << " " << setw(10) << sol.cable_length << " "
+                 << setw(10) << sol.bundle_length << " " << setw(2) << sol.used_layers << " "
+                 << setw(6) << sol.seconds << " | "
+                 << setw(11) << sol.ref_objective << " " << setw(10) << sol.ref_cable_length << " "
+                 << setw(10) << sol.ref_bundle_length << " " << setw(6) << sol.ref_seconds << " | "
+                 << setprecision(2) << gap << setprecision(4) << "\n";
+            sols.push_back(std::move(sol));
+        }
 
         writeOutputs(outdir, g, pairs, sols);
-        if (!sols.empty()) {
-            const auto& best = sols.front();
-            cout << "Best candidate:\n";
-            cout << "  feasible=" << (best.feasible ? 1 : 0) << "\n";
-            cout << "  wB=" << best.wB << ", init=" << best.init_id << "\n";
-            cout << "  objective=" << fixed << setprecision(6) << best.objective << "\n";
-            cout << "  cable_length=" << best.cable_length << ", bundle_length=" << best.bundle_length << "\n";
-            cout << "  used_layers=" << best.used_layers << ", repair_rounds=" << best.repair_rounds
-                 << ", conflicts=" << best.conflict_count << "\n";
-        }
+        cout << "\nNote: 'layered' = our manufacturable heuristic (<=copy_num forest layers,\n"
+                "satisfying the aviation acyclic/only-father constraints). 'paper' = the\n"
+                "automotive CHRP HRH (Karlsson et al.) with no structural constraints, used as\n"
+                "an unconstrained lower-reference. gap% = (layered-paper)/paper.\n";
     } catch (const exception& e) {
         cerr << "Error: " << e.what() << "\n";
         return 1;
