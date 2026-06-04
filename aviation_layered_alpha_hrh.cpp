@@ -413,14 +413,23 @@ static vector<double> baseCosts(const GraphData& g) {
     return c;
 }
 
-// CHRP objective: f = wL*fL + wB*fB, with fL demand-weighted cable length and
-// fB the bundle/harness length (each physical edge counted once if used by any
-// cable).  Matches the automotive paper's eqs. (1a),(1b),(2).
+// CHRP objective: f = wL*fL + wB*fB, with fL the demand-weighted cable length
+// and fB the bundle/harness length (each physical edge counted once if used by
+// any cable); matches the automotive paper's eqs. (1a),(1b),(2).
+//
+// Because our dataset mixes tiny per-cable demands (~1e-6) with raw physical
+// edge weights (~10-500), fL and fB differ by orders of magnitude. We therefore
+// normalize each objective by a reference scale (fL0 = sum of demand-weighted
+// shortest-path lengths, fB0 = MST/min-harness weight) so that wB genuinely
+// trades cable length against bundling and the weighted sum is O(1). The raw fL
+// and fB are still reported. Set fL0=fB0=1 to recover the un-normalized value.
 static double computeObjective(
     const GraphData& g,
     const vector<CablePair>& pairs,
     const vector<Path>& routes,
     double wB,
+    double fL0,
+    double fB0,
     double* out_cable_len = nullptr,
     double* out_bundle_len = nullptr
 ) {
@@ -436,7 +445,7 @@ static double computeObjective(
     for (int eid : used_edges) bundle_len += g.edges[eid].w;
     if (out_cable_len) *out_cable_len = cable_len;
     if (out_bundle_len) *out_bundle_len = bundle_len;
-    return wL * cable_len + wB * bundle_len;
+    return wL * (cable_len / fL0) + wB * (bundle_len / fB0);
 }
 
 // ---------------------------------------------------------------------------
@@ -444,6 +453,7 @@ static double computeObjective(
 // ---------------------------------------------------------------------------
 struct MstTree {
     vector<vector<pair<int,int>>> adj;    // node -> (nbr, edge_id) over MST edges
+    double total_weight = 0.0;            // sum of MST edge weights (min-harness scale)
 };
 
 static MstTree buildMST(const GraphData& g) {
@@ -460,6 +470,7 @@ static MstTree buildMST(const GraphData& g) {
         if (uf.unite(e.u, e.v)) {
             t.adj[e.u].push_back({e.v, eid});
             t.adj[e.v].push_back({e.u, eid});
+            t.total_weight += e.w;
         }
     }
     return t;
@@ -537,10 +548,17 @@ static PlaceResult placeInLayer(
     const CablePair& cp,
     const Layer& L,
     const unordered_map<int,int>& global_count,
-    double wB
+    double wB,
+    double fL0,
+    double fB0
 ) {
     PlaceResult pr;
-    double wL = 1.0 - wB;
+    // Normalized marginal coefficients: cable term uses wL/fL0, bundle activation
+    // term uses wB/fB0. This keeps the per-edge trade-off consistent with the
+    // normalized objective so that varying wB actually moves along the Pareto
+    // front (instead of bundle always dominating because of the tiny demands).
+    double cl = (1.0 - wB) / fL0;
+    double bl = wB / fB0;
 
     if (L.is_mst) {
         // Safe layer: route on the MST tree path. Used edges stay within the MST
@@ -552,8 +570,8 @@ static PlaceResult placeInLayer(
             double ce = g.edges[eid].w;
             bool in_layer = L.edge_count.count(eid) && L.edge_count.at(eid) > 0;
             bool in_global = global_count.count(eid) && global_count.at(eid) > 0;
-            marg += wL * cp.demand * ce;
-            if (!in_layer && !in_global) marg += wB * ce;  // newly activated edge
+            marg += cl * cp.demand * ce;
+            if (!in_layer && !in_global) marg += bl * ce;  // newly activated edge
         }
         pr.route = std::move(p);
         pr.marginal = marg;
@@ -570,7 +588,7 @@ static PlaceResult placeInLayer(
         if (in_layer) {
             // Reusing an existing layer edge adds no new edge -> no cycle risk,
             // and no new bundle activation in this layer.
-            cost[eid] = wL * cp.demand * ce;
+            cost[eid] = cl * cp.demand * ce;
         } else {
             const Edge& e = g.edges[eid];
             // Forbid new edges whose endpoints are already connected in the layer
@@ -579,7 +597,7 @@ static PlaceResult placeInLayer(
                 cost[eid] = INF;
             } else {
                 bool in_global = global_count.count(eid) && global_count.at(eid) > 0;
-                cost[eid] = wL * cp.demand * ce + (in_global ? 0.0 : wB * ce);
+                cost[eid] = cl * cp.demand * ce + (in_global ? 0.0 : bl * ce);
             }
         }
     }
@@ -600,8 +618,8 @@ static PlaceResult placeInLayer(
         double ce = g.edges[eid].w;
         bool in_layer = L.edge_count.count(eid) && L.edge_count.at(eid) > 0;
         bool in_global = global_count.count(eid) && global_count.at(eid) > 0;
-        marg += wL * cp.demand * ce;
-        if (!in_layer && !in_global) marg += wB * ce;
+        marg += cl * cp.demand * ce;
+        if (!in_layer && !in_global) marg += bl * ce;
     }
     pr.route = std::move(p);
     pr.marginal = marg;
@@ -657,7 +675,9 @@ static Solution solveLayered(
     const MstTree& mst,
     double wB,
     int copy_num,
-    int max_passes
+    int max_passes,
+    double fL0,
+    double fB0
 ) {
     auto t0 = chrono::steady_clock::now();
     int K = static_cast<int>(pairs.size());
@@ -689,7 +709,7 @@ static Solution solveLayered(
         PlaceResult best;
         int best_layer = -1;
         for (int l = 0; l < static_cast<int>(layers.size()); ++l) {
-            PlaceResult pr = placeInLayer(g, mst, pairs[k], layers[l], global_count, wB);
+            PlaceResult pr = placeInLayer(g, mst, pairs[k], layers[l], global_count, wB, fL0, fB0);
             if (pr.feasible && pr.marginal + EPS < best.marginal) {
                 best = std::move(pr);
                 best_layer = l;
@@ -697,7 +717,7 @@ static Solution solveLayered(
         }
         if (best_layer < 0) {
             // Should never happen: the MST layer always offers a route.
-            best = placeInLayer(g, mst, pairs[k], layers[0], global_count, wB);
+            best = placeInLayer(g, mst, pairs[k], layers[0], global_count, wB, fL0, fB0);
             best_layer = 0;
         }
         routes[k] = best.route;
@@ -708,7 +728,7 @@ static Solution solveLayered(
     for (int k : order) assignBest(k);
 
     // HRH improvement passes (paper Algorithm 2): re-optimise one cable at a time.
-    double best_obj = computeObjective(g, pairs, routes, wB);
+    double best_obj = computeObjective(g, pairs, routes, wB, fL0, fB0);
     for (int pass = 0; pass < max_passes; ++pass) {
         bool improved = false;
         for (int k : order) {
@@ -719,7 +739,7 @@ static Solution solveLayered(
             PlaceResult best;
             int best_layer = -1;
             for (int l = 0; l < static_cast<int>(layers.size()); ++l) {
-                PlaceResult pr = placeInLayer(g, mst, pairs[k], layers[l], global_count, wB);
+                PlaceResult pr = placeInLayer(g, mst, pairs[k], layers[l], global_count, wB, fL0, fB0);
                 if (pr.feasible && pr.marginal + EPS < best.marginal) {
                     best = std::move(pr);
                     best_layer = l;
@@ -735,7 +755,7 @@ static Solution solveLayered(
             layer_of[k] = best_layer;
             addRouteToState(g, layers[best_layer], global_count, routes[k]);
 
-            double obj = computeObjective(g, pairs, routes, wB);
+            double obj = computeObjective(g, pairs, routes, wB, fL0, fB0);
             if (obj + 1e-7 < best_obj) {
                 best_obj = obj;
                 improved = true;
@@ -754,7 +774,8 @@ static Solution solveLayered(
     sol.wB = wB;
     sol.routes = std::move(routes);
     sol.pair_to_layer = layer_of;
-    sol.objective = computeObjective(g, pairs, sol.routes, wB, &sol.cable_length, &sol.bundle_length);
+    sol.objective = computeObjective(g, pairs, sol.routes, wB, fL0, fB0,
+                                     &sol.cable_length, &sol.bundle_length);
 
     // Count actually-used layers and confirm feasibility (every layer a forest).
     set<int> used_layers;
@@ -781,35 +802,24 @@ static Solution solveLayered(
 // This is the algorithm of Karlsson et al. (paper Algorithms 2-3) applied
 // directly to our engineering topology, used only for comparison.
 // ---------------------------------------------------------------------------
-static void runPaperHRH(
+// One HRH local search (paper Algorithm 2/3) from a given initial routing.
+static vector<Path> hrhLocalSearch(
     const GraphData& g,
     const vector<CablePair>& pairs,
+    const vector<int>& order,
+    vector<Path> routes,
     double wB,
-    int max_passes,
-    vector<Path>& routes_out,
-    double& seconds_out
+    double fL0,
+    double fB0,
+    int max_passes
 ) {
-    auto t0 = chrono::steady_clock::now();
-    double wL = 1.0 - wB;
-    int K = static_cast<int>(pairs.size());
-    auto base = baseCosts(g);
-
-    // Initial routes: shortest paths.
-    vector<Path> routes(K);
-    for (int k = 0; k < K; ++k)
-        routes[k] = dijkstraPath(g, pairs[k].center_s, pairs[k].center_t, base);
-
+    double cl = (1.0 - wB) / fL0;   // normalized cable coefficient
+    double bl = wB / fB0;           // normalized bundle coefficient
     unordered_map<int,int> usage;
-    for (int k = 0; k < K; ++k)
-        for (int eid : routes[k].edge_ids) usage[eid]++;
+    for (const auto& r : routes)
+        for (int eid : r.edge_ids) usage[eid]++;
 
-    vector<int> order(K);
-    iota(order.begin(), order.end(), 0);
-    sort(order.begin(), order.end(), [&](int a, int b) {
-        return pairs[a].demand > pairs[b].demand;
-    });
-
-    double best_obj = computeObjective(g, pairs, routes, wB);
+    double best_obj = computeObjective(g, pairs, routes, wB, fL0, fB0);
     for (int pass = 0; pass < max_passes; ++pass) {
         bool improved = false;
         for (int k : order) {
@@ -818,13 +828,13 @@ static void runPaperHRH(
             for (int eid : g.center_edge_ids) {
                 double ce = g.edges[eid].w;
                 bool shared = usage.count(eid) && usage.at(eid) > 0;
-                cost[eid] = wL * pairs[k].demand * ce + (shared ? 0.0 : wB * ce);
+                cost[eid] = cl * pairs[k].demand * ce + (shared ? 0.0 : bl * ce);
             }
             Path cand = dijkstraPath(g, pairs[k].center_s, pairs[k].center_t, cost);
             Path chosen = cand.feasible ? cand : routes[k];
             vector<Path> trial = routes;
             trial[k] = chosen;
-            double obj = computeObjective(g, pairs, trial, wB);
+            double obj = computeObjective(g, pairs, trial, wB, fL0, fB0);
             if (obj + 1e-7 < best_obj) {
                 routes[k] = chosen;
                 best_obj = obj;
@@ -834,7 +844,50 @@ static void runPaperHRH(
         }
         if (!improved) break;
     }
-    routes_out = std::move(routes);
+    return routes;
+}
+
+static void runPaperHRH(
+    const GraphData& g,
+    const vector<CablePair>& pairs,
+    const MstTree& mst,
+    double wB,
+    int max_passes,
+    double fL0,
+    double fB0,
+    vector<Path>& routes_out,
+    double& seconds_out
+) {
+    auto t0 = chrono::steady_clock::now();
+    int K = static_cast<int>(pairs.size());
+    auto base = baseCosts(g);
+
+    vector<int> order(K);
+    iota(order.begin(), order.end(), 0);
+    sort(order.begin(), order.end(), [&](int a, int b) {
+        return pairs[a].demand > pairs[b].demand;
+    });
+
+    // The paper locally optimises several initial routings (it uses Lagrangian
+    // dual solutions and heuristic constructions, Section 3.2-3.3) and keeps the
+    // best.  We give the unconstrained reference its strongest fair shot by
+    // running the HRH from two initialisations and keeping the better result:
+    //   (A) shortest paths  -> good for low wB,
+    //   (B) MST tree paths   -> a bundled start that lets the HRH reach a tree
+    //                           backbone for high wB (a proxy for the paper's
+    //                           Lagrangian/bundled initial routes).
+    vector<Path> initA(K), initB(K);
+    for (int k = 0; k < K; ++k) {
+        initA[k] = dijkstraPath(g, pairs[k].center_s, pairs[k].center_t, base);
+        initB[k] = treePath(g, mst, pairs[k].center_s, pairs[k].center_t);
+        if (!initB[k].feasible) initB[k] = initA[k];
+    }
+    vector<Path> rA = hrhLocalSearch(g, pairs, order, std::move(initA), wB, fL0, fB0, max_passes);
+    vector<Path> rB = hrhLocalSearch(g, pairs, order, std::move(initB), wB, fL0, fB0, max_passes);
+    double oA = computeObjective(g, pairs, rA, wB, fL0, fB0);
+    double oB = computeObjective(g, pairs, rB, wB, fL0, fB0);
+
+    routes_out = (oA <= oB) ? std::move(rA) : std::move(rB);
     seconds_out = chrono::duration<double>(chrono::steady_clock::now() - t0).count();
 }
 
@@ -972,17 +1025,35 @@ int main(int argc, char** argv) {
 
         MstTree mst = buildMST(g);
 
+        // Reference scales for normalizing the two objectives onto a comparable
+        // footing (otherwise the ~1e-6 demands make fL negligible against fB and
+        // the wB sweep degenerates into "always minimize the bundle").
+        //   fL0 = sum of demand-weighted shortest-path lengths (min cable length)
+        //   fB0 = MST total weight (a min-harness/bundle scale)
+        auto base0 = baseCosts(g);
+        double fL0 = 0.0;
+        for (const auto& cp : pairs) {
+            Path sp = dijkstraPath(g, cp.center_s, cp.center_t, base0);
+            if (sp.feasible) fL0 += cp.demand * sp.length;
+        }
+        double fB0 = mst.total_weight;
+        if (fL0 < EPS) fL0 = 1.0;
+        if (fB0 < EPS) fB0 = 1.0;
+        cerr << "Normalization scales: fL0(min cable)=" << fL0
+             << ", fB0(MST harness)=" << fB0 << "\n";
+
         vector<Solution> sols;
         cout << fixed << setprecision(4);
-        cout << "wB      | layered: obj        cable      bundle     L  t(s)   | paper: obj        cable      bundle     t(s)   | gap%\n";
-        cout << "--------+----------------------------------------------------+---------------------------------------------+------\n";
+        cout << "(obj is the normalized weighted sum wL*fL/fL0 + wB*fB/fB0; cable=fL, bundle=fB are raw)\n";
+        cout << "wB      | layered: obj      cable      bundle     L  t(s)   | paper: obj      cable      bundle     t(s)   | gap%\n";
+        cout << "--------+--------------------------------------------------+-------------------------------------------+------\n";
         for (double wB : wb_values) {
-            Solution sol = solveLayered(g, pairs, mst, wB, copy_num, maxPasses);
+            Solution sol = solveLayered(g, pairs, mst, wB, copy_num, maxPasses, fL0, fB0);
 
             vector<Path> ref_routes;
             double ref_sec = 0.0;
-            runPaperHRH(g, pairs, wB, maxPasses, ref_routes, ref_sec);
-            sol.ref_objective = computeObjective(g, pairs, ref_routes, wB,
+            runPaperHRH(g, pairs, mst, wB, maxPasses, fL0, fB0, ref_routes, ref_sec);
+            sol.ref_objective = computeObjective(g, pairs, ref_routes, wB, fL0, fB0,
                                                  &sol.ref_cable_length, &sol.ref_bundle_length);
             sol.ref_seconds = ref_sec;
 
